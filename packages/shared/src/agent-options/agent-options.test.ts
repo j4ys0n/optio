@@ -127,9 +127,9 @@ describe("mergeLiveModels", () => {
   });
 
   it("preserves baseline metadata when a live id matches", () => {
-    const opus = ANTHROPIC_CATALOG.models.find((m) => m.id === "claude-opus-4-7")!;
-    const merged = mergeLiveModels(ANTHROPIC_CATALOG, ["claude-opus-4-7"]);
-    const mergedOpus = merged.models.find((m) => m.id === "claude-opus-4-7")!;
+    const opus = ANTHROPIC_CATALOG.models.find((m) => m.id === "claude-opus-4-8")!;
+    const merged = mergeLiveModels(ANTHROPIC_CATALOG, ["claude-opus-4-8"]);
+    const mergedOpus = merged.models.find((m) => m.id === "claude-opus-4-8")!;
     expect(mergedOpus.label).toBe(opus.label);
     expect(mergedOpus.latest).toBe(true);
     expect(mergedOpus.source).toBe("baseline");
