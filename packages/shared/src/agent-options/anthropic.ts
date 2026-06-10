@@ -53,7 +53,6 @@ export const ANTHROPIC_CATALOG: ProviderCatalog = {
       id: "claude-fable-5",
       label: "Fable 5",
       family: "fable",
-      latest: true,
       source: "baseline",
     },
   ],
