@@ -12,7 +12,7 @@ import { DetailHeader } from "@/components/detail-header";
 import { PrStatusBar } from "@/components/pr-status-bar";
 import { ChatComposer } from "@/components/chat-box";
 import { StateBadge } from "@/components/state-badge";
-import { TokenRefreshBanner } from "@/components/token-refresh-banner";
+import { TokenRefreshBanner, GitHubTokenBanner } from "@/components/token-refresh-banner";
 import { api } from "@/lib/api-client";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { classifyError } from "@optio/shared";
@@ -502,7 +502,16 @@ export default function TaskDetailPage({ params }: { params: Promise<{ id: strin
         (isTerminal || task.state === "needs_attention") &&
         (() => {
           const classified = classifyError(task.errorMessage);
-          if (classified.category === "auth") {
+          if (classified.recovery === "github-token") {
+            return (
+              <div className="shrink-0 border-b border-border bg-bg-card">
+                <div className="max-w-5xl mx-auto px-4 py-3">
+                  <GitHubTokenBanner onSaved={refresh} />
+                </div>
+              </div>
+            );
+          }
+          if (classified.category === "auth" && !classified.recovery) {
             return (
               <div className="shrink-0 border-b border-border bg-bg-card">
                 <div className="max-w-5xl mx-auto px-4 py-3">

@@ -157,4 +157,51 @@ describe("classifyError", () => {
     expect(result.category).toBe("auth");
     expect(result.title).toBe("Authentication token expired");
   });
+
+  it("classifies GitHub secondary rate limit as non-retryable with rate-limit recovery", () => {
+    const result = classifyError(
+      "GitHub API error 403: You have exceeded a secondary rate limit and have been temporarily blocked from content creation.",
+    );
+    expect(result.category).toBe("auth");
+    expect(result.title).toBe("GitHub secondary rate limit");
+    expect(result.retryable).toBe(false);
+    expect(result.recovery).toBe("rate-limit");
+  });
+
+  it("classifies GitHub bad credentials as non-retryable with github-token recovery", () => {
+    const result = classifyError('GitHub API error 401: {"message":"Bad credentials"}');
+    expect(result.title).toBe("GitHub credentials invalid");
+    expect(result.retryable).toBe(false);
+    expect(result.recovery).toBe("github-token");
+  });
+
+  it("classifies GitHub permission error as non-retryable with github-permission recovery", () => {
+    const result = classifyError(
+      'GitHub API error 403: {"message":"Resource not accessible by integration"}',
+    );
+    expect(result.title).toBe("GitHub permission denied");
+    expect(result.retryable).toBe(false);
+    expect(result.recovery).toBe("github-permission");
+  });
+
+  it("does NOT classify unrelated 'bad credentials' (no GitHub wrapper) as a GitHub error", () => {
+    const result = classifyError("Internal connector rejected the request: bad credentials");
+    expect(result.title).not.toBe("GitHub credentials invalid");
+    expect(result.recovery).toBeUndefined();
+    expect(result.category).toBe("unknown");
+    expect(result.retryable).toBe(true);
+  });
+
+  it("does NOT classify an unrelated 'resource not accessible' string as a GitHub error", () => {
+    const result = classifyError("resource not accessible by integration");
+    expect(result.title).not.toBe("GitHub permission denied");
+    expect(result.recovery).toBeUndefined();
+  });
+
+  it("still treats a non-GitHub provider rate limit as retryable (generic rule)", () => {
+    const result = classifyError("API returned 429 too many requests");
+    expect(result.title).toBe("API rate limit exceeded");
+    expect(result.retryable).toBe(true);
+    expect(result.recovery).toBeUndefined();
+  });
 });

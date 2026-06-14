@@ -4,12 +4,71 @@ export interface ClassifiedError {
   description: string;
   remedy: string;
   retryable: boolean;
+  /**
+   * Stable discriminator for which provider-specific recovery surface the UI
+   * should render. Absent for generic errors. Set explicitly by classifiers so
+   * renderers never have to infer the provider from display-title text.
+   */
+  recovery?: "claude-token" | "github-token" | "github-permission" | "rate-limit";
 }
 
 const ERROR_PATTERNS: Array<{
   pattern: RegExp;
   classify: (match: RegExpMatchArray) => ClassifiedError;
 }> = [
+  // ── GitHub write-path failures ──────────────────────────────────────────
+  // Must precede the generic rate-limit rule and the LLM auth rule. Scoped to
+  // the verified `GitHub API error <status>: <body>` wrapper that GitHubPlatform
+  // produces, so an unrelated provider/service emitting e.g. "bad credentials"
+  // is NOT misclassified as a permanent GitHub failure. `recovery` tells the UI
+  // which provider-specific recovery surface to render.
+  {
+    pattern: /github api error \d+:.*(secondary rate limit|abuse detection)/is,
+    classify: () => ({
+      category: "auth",
+      title: "GitHub secondary rate limit",
+      description:
+        "GitHub temporarily blocked writes (PRs, comments, reviews, merges) because too many " +
+        "content-creating requests were sent too quickly. This is a secondary rate limit, separate " +
+        "from the primary hourly quota.",
+      remedy:
+        "Stop retrying immediately. Wait at least 60 seconds (honor the Retry-After header if present) " +
+        "before further GitHub writes, and reduce concurrent agents/auto-resumes if it recurs.",
+      retryable: false,
+      recovery: "rate-limit",
+    }),
+  },
+  {
+    pattern: /github api error \d+:.*bad credentials/is,
+    classify: () => ({
+      category: "auth",
+      title: "GitHub credentials invalid",
+      description:
+        "GitHub rejected the token (HTTP 401 Bad credentials). The configured GitHub token is missing, " +
+        "expired, or revoked. Retrying with the same token will keep failing.",
+      remedy:
+        "Reconnect the GitHub App or refresh the GITHUB_TOKEN secret. Do not retry until the credential " +
+        "is replaced.",
+      retryable: false,
+      recovery: "github-token",
+    }),
+  },
+  {
+    pattern:
+      /github api error \d+:.*resource not accessible by (integration|personal access token|fine-grained personal access token)/is,
+    classify: () => ({
+      category: "auth",
+      title: "GitHub permission denied",
+      description:
+        "The GitHub token authenticated but lacks permission for this operation (HTTP 403 Resource not " +
+        "accessible). The App installation or token is missing a required scope/permission.",
+      remedy:
+        "Grant the missing permission to the GitHub App installation (or PAT scopes) — e.g. Pull requests: " +
+        "write, Issues: write, Contents: write — then retry.",
+      retryable: false,
+      recovery: "github-permission",
+    }),
+  },
   {
     pattern: /ErrImageNeverPull|InvalidImageName/i,
     classify: (match) => {
