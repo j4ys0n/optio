@@ -15,9 +15,11 @@ import {
   PrReviewState,
   PersistentAgentState,
   parsePrUrl,
+  parseIntEnv,
 } from "@optio/shared";
 import * as taskService from "./task-service.js";
 import { enqueueReconcile } from "./reconcile-queue.js";
+import { classifyGitHubFailure, type GitHubFailure } from "./git-platform/github.js";
 import { logger } from "../logger.js";
 
 /**
@@ -475,6 +477,8 @@ async function applyAutoMergePr(snapshot: WorldSnapshot): Promise<ExecuteOutcome
   try {
     await platform.mergePullRequest(ri, parsed.prNumber, "squash");
   } catch (err) {
+    const cooldown = await handleGithubWriteBlock(snapshot, err);
+    if (cooldown) return cooldown;
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn({ err, taskId, prNumber: parsed.prNumber }, "auto-merge failed");
     return { status: "error", reason: `merge_failed:${msg}`, error: err };
@@ -680,6 +684,123 @@ async function casUpdate(
   return rows.length > 0 ? "applied" : "stale";
 }
 
+// ── GitHub write cooldown ───────────────────────────────────────────────────
+// When a content-creating GitHub write (auto-merge, auto-submit-review) is
+// blocked by a rate limit or an auth/permission failure, we must stop EVERY
+// reconcile producer (event-driven, pr-watcher, resync) from re-issuing that
+// write until a deadline — not just the one delayed retry job. We do that by
+// persisting `reconcileBackoffUntil` on the run: the pure decision functions
+// already short-circuit to a noop while it is in the future, so every producer
+// becomes harmless. A single delayed reconcile is scheduled for the deadline.
+
+const GITHUB_RATE_LIMIT_MIN_BACKOFF_MS = 60_000; // GitHub requires >=60s when no Retry-After
+const GITHUB_RATE_LIMIT_MAX_BACKOFF_MS = 30 * 60_000; // cap exponential growth
+
+function githubCooldownDeadlineMs(
+  failure: GitHubFailure,
+  attempts: number,
+  nowMs: number,
+): { untilMs: number; incrementAttempts: boolean } {
+  switch (failure.kind) {
+    case "primary_rate_limit":
+      // Primary quota: wait until the reset, not the generic 60s floor.
+      return {
+        untilMs: failure.resetAtMs ?? nowMs + GITHUB_RATE_LIMIT_MIN_BACKOFF_MS,
+        incrementAttempts: false,
+      };
+    case "secondary_rate_limit": {
+      if (failure.retryAfterMs != null) {
+        return {
+          untilMs: nowMs + Math.max(failure.retryAfterMs, GITHUB_RATE_LIMIT_MIN_BACKOFF_MS),
+          incrementAttempts: false,
+        };
+      }
+      // No Retry-After: bounded exponential from 60s, escalating with attempts.
+      const backoff = Math.min(
+        GITHUB_RATE_LIMIT_MAX_BACKOFF_MS,
+        GITHUB_RATE_LIMIT_MIN_BACKOFF_MS * 2 ** Math.min(attempts, 6),
+      );
+      return {
+        untilMs: nowMs + backoff + Math.floor(Math.random() * 5_000),
+        incrementAttempts: true,
+      };
+    }
+    case "auth":
+    case "permission":
+      // Retrying the same credential/permission is futile — hold for a long
+      // window rather than looping. The classified errorMessage drives the
+      // GitHub credential/scope recovery UI.
+      return {
+        untilMs: nowMs + parseIntEnv("OPTIO_GITHUB_AUTH_COOLDOWN_MS", 60 * 60_000),
+        incrementAttempts: false,
+      };
+  }
+}
+
+/**
+ * Persist a monotonic (never-shortening) GitHub cooldown on a repo task or
+ * pr-review run, bumping updated_at so any in-flight CAS write becomes stale and
+ * cannot perform a concurrent GitHub write. `GREATEST` guarantees two concurrent
+ * failures keep the later deadline.
+ */
+async function persistGithubCooldown(
+  kind: "repo" | "pr-review",
+  id: string,
+  untilMs: number,
+  opts: { incrementAttempts: boolean; errorMessage: string },
+): Promise<void> {
+  const until = new Date(untilMs);
+  if (kind === "repo") {
+    const set: Record<string, unknown> = {
+      reconcileBackoffUntil: sql`GREATEST(COALESCE(${tasks.reconcileBackoffUntil}, ${until}), ${until})`,
+      errorMessage: opts.errorMessage,
+      updatedAt: new Date(),
+    };
+    if (opts.incrementAttempts) set.reconcileAttempts = sql`${tasks.reconcileAttempts} + 1`;
+    await db.update(tasks).set(set).where(eq(tasks.id, id));
+    return;
+  }
+  const set: Record<string, unknown> = {
+    reconcileBackoffUntil: sql`GREATEST(COALESCE(${prReviews.reconcileBackoffUntil}, ${until}), ${until})`,
+    errorMessage: opts.errorMessage,
+    updatedAt: new Date(),
+  };
+  if (opts.incrementAttempts) set.reconcileAttempts = sql`${prReviews.reconcileAttempts} + 1`;
+  await db.update(prReviews).set(set).where(eq(prReviews.id, id));
+}
+
+/**
+ * If `err` is a GitHub write block (rate limit / auth / permission), persist a
+ * cooldown, schedule a single delayed wake, and return an `applied` outcome so
+ * the worker does NOT additionally fast-retry. Returns null for transient or
+ * non-GitHub errors so the caller falls through to its normal error handling.
+ */
+async function handleGithubWriteBlock(
+  snapshot: WorldSnapshot,
+  err: unknown,
+): Promise<ExecuteOutcome | null> {
+  const failure = classifyGitHubFailure(err);
+  if (!failure) return null;
+  const run = snapshot.run;
+  if (run.kind !== "repo" && run.kind !== "pr-review") return null;
+  const nowMs = Date.now();
+  const attempts = run.status.reconcileAttempts ?? 0;
+  const { untilMs, incrementAttempts } = githubCooldownDeadlineMs(failure, attempts, nowMs);
+  await persistGithubCooldown(run.kind, run.ref.id, untilMs, {
+    incrementAttempts,
+    errorMessage: err instanceof Error ? err.message : String(err),
+  });
+  await enqueueReconcile(run.ref, {
+    reason: `github_cooldown:${failure.kind}`,
+    delayMs: Math.max(0, untilMs - nowMs),
+  });
+  logger.warn(
+    { runId: run.ref.id, kind: failure.kind, untilMs },
+    "GitHub write blocked — persisted reconcile cooldown",
+  );
+  return { status: "applied", reason: `github_cooldown:${failure.kind}` };
+}
+
 // ── PR Review applicators ──────────────────────────────────────────────────
 
 async function applyPrReviewTransition(
@@ -741,6 +862,8 @@ async function applySubmitReview(snapshot: WorldSnapshot): Promise<ExecuteOutcom
     await submitReview(prReviewId);
     return { status: "applied", reason: "auto_submitted" };
   } catch (err) {
+    const cooldown = await handleGithubWriteBlock(snapshot, err);
+    if (cooldown) return cooldown;
     const msg = err instanceof Error ? err.message : String(err);
     return { status: "error", reason: msg, error: err };
   }
